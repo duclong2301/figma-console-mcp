@@ -1,0 +1,16 @@
+{
+  "name": "figma-console-mcp",
+  "version": "1.0.0",
+  "description": "MCP server — tương tác trực tiếp với Figma Desktop qua plugin bridge (không REST API). Khi bật tính năng console trực tiếp: gửi 120 tool cùng lúc thay vì từng tool như bản gốc",
+  "main": "index.js",
+  "bin": {
+    "figma-console-mcp": "./index.js"
+  },
+  "scripts": {
+    "start": "node index.js"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.0.0",
+    "ws": "^8.18.0"
+  }
+}
