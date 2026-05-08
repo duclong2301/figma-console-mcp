@@ -1,79 +1,47 @@
 /**
- * figma-console-bridge — Figma Desktop Plugin
- * Kết nối WebSocket về figma-console-mcp server,
- * nhận lệnh JS và thực thi trong Figma Plugin context.
+ * figma-console-bridge — code.js (Plugin Sandbox)
  *
- * File này là plugin/code.js
+ * KHÔNG có WebSocket ở đây — sandbox không support.
+ * WebSocket chạy trong ui.html (iframe).
+ *
+ * Flow:
+ *   MCP Server <--WS--> ui.html <--postMessage--> code.js <--figma API-->
  */
 
-const WS_URL = "ws://localhost:9988";
-const RECONNECT_DELAY = 3000;
+figma.showUI(__html__, { width: 280, height: 180, title: "Console Bridge" });
 
-figma.showUI(__html__, { width: 280, height: 160, title: "Console Bridge" });
+// Nhận lệnh từ ui.html, thực thi figma API, trả kết quả về ui.html
+figma.ui.onmessage = async function(msg) {
+  if (msg.type !== "eval") return;
 
-let ws = null;
+  var id = msg.id;
+  var code = msg.code;
 
-function connect() {
-  figma.ui.postMessage({ type: "status", text: "Connecting...", color: "#F59E0B" });
+  try {
+    // Dùng Function constructor thay vì eval — support await
+    var fn = new Function("return (async () => { " + code + " })()");
+    var result = await fn();
 
-  ws = new WebSocket(WS_URL);
-
-  ws.onopen = () => {
-    figma.ui.postMessage({ type: "status", text: "✅ Connected to Claude MCP", color: "#10B981" });
-    figma.notify("figma-console-bridge: Connected ✓", { timeout: 2000 });
-  };
-
-  ws.onmessage = async (event) => {
-    let msg;
-    try {
-      msg = JSON.parse(event.data);
-    } catch {
-      return;
-    }
-
-    const { id, type, payload } = msg;
-
-    if (type === "eval") {
+    var serialized;
+    if (result === undefined || result === null) {
+      serialized = null;
+    } else if (typeof result === "string") {
+      serialized = result;
+    } else {
       try {
-        // Wrap code trong async IIFE để support await
-        const wrappedCode = `(async () => { ${payload.code} })()`;
-        // eslint-disable-next-line no-eval
-        const result = await eval(wrappedCode);
-
-        let serialized;
-        if (result === undefined || result === null) {
-          serialized = null;
-        } else if (typeof result === "string") {
-          serialized = result;
-        } else {
-          try {
-            serialized = JSON.stringify(result, null, 2);
-          } catch {
-            serialized = String(result);
-          }
-        }
-
-        ws.send(JSON.stringify({ id, result: serialized }));
-        figma.ui.postMessage({ type: "log", text: `✓ exec #${id}` });
-      } catch (err) {
-        ws.send(JSON.stringify({ id, error: err.message || String(err) }));
-        figma.ui.postMessage({ type: "log", text: `✗ #${id}: ${err.message}`, color: "#EF4444" });
+        serialized = JSON.stringify(result, null, 2);
+      } catch (e2) {
+        serialized = String(result);
       }
     }
-  };
 
-  ws.onerror = () => {
-    figma.ui.postMessage({ type: "status", text: "❌ Connection error", color: "#EF4444" });
-  };
+    figma.ui.postMessage({ type: "result", id: id, result: serialized });
 
-  ws.onclose = () => {
-    figma.ui.postMessage({ type: "status", text: `Reconnecting in ${RECONNECT_DELAY / 1000}s...`, color: "#9CA3AF" });
-    setTimeout(connect, RECONNECT_DELAY);
-  };
-}
+  } catch (err) {
+    figma.ui.postMessage({ type: "result", id: id, error: err.message || String(err) });
+  }
+};
 
-connect();
-
-figma.on("close", () => {
-  if (ws) ws.close();
+figma.on("close", function() {
+  figma.ui.postMessage({ type: "close" });
 });

@@ -10,7 +10,7 @@
     background: #1E1E1E;
     color: #E5E5E5;
     padding: 12px;
-    height: 160px;
+    height: 180px;
     display: flex;
     flex-direction: column;
     gap: 8px;
@@ -25,10 +25,11 @@
     text-transform: uppercase;
   }
   .dot {
-    width: 6px; height: 6px;
+    width: 7px; height: 7px;
     border-radius: 50%;
     background: #F59E0B;
     flex-shrink: 0;
+    transition: background 0.3s;
   }
   #status {
     font-size: 12px;
@@ -39,6 +40,7 @@
     border: 1px solid #333;
     color: #F59E0B;
   }
+  .port { color: #4B5563; font-size: 10px; }
   #log {
     flex: 1;
     background: #111;
@@ -53,9 +55,7 @@
     flex-direction: column;
     gap: 2px;
   }
-  .log-line { opacity: 0.85; }
   .log-line.err { color: #FCA5A5; }
-  .port { color: #6B7280; font-size: 10px; margin-top: 2px; }
 </style>
 </head>
 <body>
@@ -67,34 +67,102 @@
   <div class="port">ws://localhost:9988</div>
   <div id="log"></div>
 
-  <script>
-    const statusEl = document.getElementById('status');
-    const dotEl = document.getElementById('dot');
-    const logEl = document.getElementById('log');
-    const MAX_LOGS = 20;
+<script>
+var WS_URL = 'ws://localhost:9988';
+var RECONNECT_MS = 3000;
+var ws = null;
+var pendingCalls = {}; // id -> {resolve, reject}
 
-    window.onmessage = (event) => {
-      const msg = event.data.pluginMessage;
-      if (!msg) return;
+var statusEl = document.getElementById('status');
+var dotEl    = document.getElementById('dot');
+var logEl    = document.getElementById('log');
 
-      if (msg.type === 'status') {
-        statusEl.textContent = msg.text;
-        statusEl.style.color = msg.color || '#E5E5E5';
-        dotEl.style.background = msg.color || '#9CA3AF';
-      }
+function setStatus(text, color) {
+  statusEl.textContent = text;
+  statusEl.style.color = color;
+  dotEl.style.background = color;
+}
 
-      if (msg.type === 'log') {
-        const line = document.createElement('div');
-        line.className = 'log-line' + (msg.color === '#EF4444' ? ' err' : '');
-        line.textContent = msg.text;
-        logEl.appendChild(line);
-        // Giữ tối đa MAX_LOGS dòng
-        while (logEl.children.length > MAX_LOGS) {
-          logEl.removeChild(logEl.firstChild);
-        }
-        logEl.scrollTop = logEl.scrollHeight;
-      }
-    };
-  </script>
+function addLog(text, isErr) {
+  var line = document.createElement('div');
+  line.className = 'log-line' + (isErr ? ' err' : '');
+  line.textContent = text;
+  logEl.appendChild(line);
+  while (logEl.children.length > 30) logEl.removeChild(logEl.firstChild);
+  logEl.scrollTop = logEl.scrollHeight;
+}
+
+// ── Nhận kết quả từ code.js (figma sandbox) ──────────────────
+window.onmessage = function(event) {
+  var msg = event.data.pluginMessage;
+  if (!msg) return;
+
+  if (msg.type === 'result') {
+    var pending = pendingCalls[msg.id];
+    if (!pending) return;
+    delete pendingCalls[msg.id];
+    if (msg.error) {
+      addLog('✗ #' + msg.id + ': ' + msg.error, true);
+      pending.reject(msg.error);
+    } else {
+      addLog('✓ exec #' + msg.id);
+      pending.resolve(msg.result);
+    }
+  }
+};
+
+// ── WebSocket → MCP Server ────────────────────────────────────
+function connect() {
+  setStatus('Connecting...', '#F59E0B');
+  ws = new WebSocket(WS_URL);
+
+  ws.onopen = function() {
+    setStatus('✅ Connected to Claude MCP', '#10B981');
+    addLog('Connected ✓');
+  };
+
+  ws.onmessage = function(event) {
+    var msg;
+    try { msg = JSON.parse(event.data); } catch(e) { return; }
+
+    if (msg.type === 'eval') {
+      // Gửi sang code.js để thực thi trong figma sandbox
+      var id = msg.id;
+      var code = msg.payload.code;
+
+      var p = new Promise(function(resolve, reject) {
+        pendingCalls[id] = { resolve: resolve, reject: reject };
+        // Timeout 25s
+        setTimeout(function() {
+          if (pendingCalls[id]) {
+            delete pendingCalls[id];
+            reject('Timeout — code.js không phản hồi');
+          }
+        }, 25000);
+      });
+
+      // Post sang plugin sandbox
+      parent.postMessage({ pluginMessage: { type: 'eval', id: id, code: code } }, '*');
+
+      p.then(function(result) {
+        ws.send(JSON.stringify({ id: id, result: result }));
+      }).catch(function(err) {
+        ws.send(JSON.stringify({ id: id, error: String(err) }));
+      });
+    }
+  };
+
+  ws.onerror = function() {
+    setStatus('❌ Error', '#EF4444');
+  };
+
+  ws.onclose = function() {
+    setStatus('Reconnecting...', '#9CA3AF');
+    setTimeout(connect, RECONNECT_MS);
+  };
+}
+
+connect();
+</script>
 </body>
 </html>

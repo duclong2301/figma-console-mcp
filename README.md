@@ -1,124 +1,102 @@
 # figma-console-mcp
 
-Figma MCP server via plugin bridge — no REST API, no rate limits. Turn text into designs and designs into real code. Works with Cursor, Claude, GitHub Copilot, and any MCP-compatible AI tool.
+Cho phép Claude gửi JavaScript trực tiếp vào Figma Desktop plugin context — không giới hạn rate, không cần tool call riêng lẻ.
 
-> **Credits / Nguồn gốc:** Dự án này được xây dựng dựa trên ý tưởng và kiến trúc từ [**vkhanhqui/figma-mcp-go**](https://github.com/vkhanhqui/figma-mcp-go) — một MCP server Figma mã nguồn mở không dùng REST API. Mọi công sức sáng tạo thuộc về tác giả gốc.
+## Architecture
 
----
-
-## Tại sao tồn tại
-
-Hầu hết các Figma MCP server đều dựa vào **Figma REST API** — và bị giới hạn nghiêm ngặt:
-
-| Plan | Giới hạn |
-|------|-----------|
-| Starter / View / Collab | **6 lần gọi/tháng** |
-| Pro / Org (Dev seat) | 200 lần/ngày |
-| Enterprise | 600 lần/ngày |
-
-Dự án này **không dùng REST API**. Thay vào đó, giao tiếp trực tiếp với Figma thông qua plugin bridge — miễn phí, không giới hạn tốc độ.
-
----
-
-## Điểm nổi bật
-
-- Không cần Figma API token
-- Không bị giới hạn rate limit — thân thiện với gói miễn phí
-- **Đọc và Ghi** dữ liệu Figma trực tiếp qua plugin bridge
-- Tự động hoá thiết kế: styles, variables, components, prototypes, content
-- Hỗ trợ: Cursor, Claude, GitHub Copilot, và mọi AI tool tương thích MCP
-- **Khi bật tính năng tương tác trực tiếp với Figma console:** server đăng ký và gửi toàn bộ **120 tool** đến AI client trong một lần duy nhất — thay vì gửi từng tool một như bản gốc (`figma-mcp-go`), giúp khởi tạo nhanh hơn và không bỏ sót tool nào
-
----
-
-## Cài đặt
-
-### 1. Chạy MCP server
-
-```bash
-node index.js
+```
+Claude Desktop
+    ↕ stdio (MCP)
+Node.js MCP Server (index.js)  ← port 9988 WebSocket →  Figma Desktop Plugin (code.js)
+                                                                ↕
+                                                          figma.* Plugin API
 ```
 
-Hoặc cấu hình trong MCP client:
+---
 
-**.mcp.json** (Claude và các tool tương thích MCP)
+## Setup (3 bước)
+
+### Bước 1 — Cài MCP server
+
+```bash
+# Copy thư mục này vào máy Windows của bạn, ví dụ:
+# F:\Tools\figma-console-mcp\
+
+cd F:\Tools\figma-console-mcp
+npm install
+```
+
+### Bước 2 — Đăng ký plugin trong Figma Desktop
+
+1. Mở Figma Desktop
+2. Menu → **Plugins** → **Development** → **Import plugin from manifest...**
+3. Chọn file `plugin/manifest.json`
+4. Plugin `figma-console-bridge` sẽ xuất hiện trong danh sách
+
+### Bước 3 — Thêm vào Claude Desktop config
+
+Mở `%APPDATA%\Claude\claude_desktop_config.json`, thêm:
+
 ```json
 {
   "mcpServers": {
-    "figma-console-mcp": {
+    "figma-mcp-go": {
+      "command": "F:\\Downloads\\pluginfigma\\plugin\\figma-mcp-go.exe"
+    },
+    "figma-console": {
       "command": "node",
-      "args": ["/path/to/figma-console-mcp/index.js"]
+      "args": ["F:\\Tools\\figma-console-mcp\\index.js"]
     }
   }
 }
 ```
 
-**.vscode/mcp.json** (Cursor / VS Code / GitHub Copilot)
-```json
-{
-  "servers": {
-    "figma-console-mcp": {
-      "type": "stdio",
-      "command": "node",
-      "args": ["/path/to/figma-console-mcp/index.js"]
-    }
-  }
-}
-```
-
-### 2. Cài Figma plugin
-
-1. Mở Figma Desktop: **Plugins → Development → Import plugin from manifest**
-2. Chọn file `plugin/manifest.json` trong thư mục này
-3. Chạy plugin bên trong một file Figma bất kỳ
-4. Giữ plugin mở trong khi dùng MCP server
+Restart Claude Desktop.
 
 ---
 
-## Cấu trúc dự án
+## Cách dùng
 
+### Mỗi lần làm việc
+
+1. Mở file Figma cần chỉnh
+2. **Plugins** → **Development** → **figma-console-bridge** → **Run**
+3. Panel nhỏ hiện ra, chờ "✅ Connected to Claude MCP"
+4. Chat với Claude như bình thường
+
+### Tools có sẵn cho Claude
+
+| Tool | Mô tả |
+|------|-------|
+| `figma_eval` | Chạy JS bất kỳ trong Figma context |
+| `figma_status` | Kiểm tra kết nối |
+| `figma_get_selection` | Lấy thông tin node đang select |
+| `figma_get_page` | Lấy cấu trúc trang hiện tại |
+
+### Ví dụ Claude có thể làm
+
+```js
+// Đổi màu tất cả text node trên trang
+figma.currentPage.findAll(n => n.type === 'TEXT')
+  .forEach(n => n.fills = [{type:'SOLID', color:{r:0.1,g:0.37,b:0.64}}])
 ```
-figma-console-mcp/
-├── index.js              # MCP server chính (Node.js)
-├── package.json
-├── package-lock.json
-└── plugin/
-    ├── manifest.json     # Manifest của Figma plugin
-    ├── code.js           # Logic plugin (chạy trong Figma sandbox)
-    └── ui.html           # Giao diện plugin (panel)
+
+```js
+// Lấy tất cả frame names
+JSON.stringify(figma.currentPage.children.map(n => n.name))
+```
+
+```js
+// Tạo component nhanh từ selection
+const sel = figma.currentPage.selection[0]
+figma.createComponentFromNode(sel)
 ```
 
 ---
 
-## Cách hoạt động
+## Notes
 
-```
- AI Tool (Claude, Cursor, ...)
-       │  MCP protocol (stdio)
-       ▼
-  index.js (MCP Server)
-       │  WebSocket
-       ▼
-  Figma Plugin (plugin/code.js)
-       │  Figma Plugin API
-       ▼
-  Figma Document
-```
-
-MCP server nhận lệnh từ AI tool qua stdio, chuyển đến Figma plugin qua WebSocket. Plugin thực thi trực tiếp trong Figma mà không cần REST API.
-
----
-
-## Nguồn gốc & Attribution
-
-Dự án này là một phiên bản Node.js, lấy cảm hứng và kiến trúc từ:
-
-- **[vkhanhqui/figma-mcp-go](https://github.com/vkhanhqui/figma-mcp-go)** — Go-based Figma MCP server, tác giả gốc của ý tưởng plugin bridge không dùng REST API.
-
-Mọi công nhận xứng đáng thuộc về tác giả gốc. Dự án này chỉ là một adaptation cho môi trường Node.js.
-
----
-
-## License
-
-MIT — xem file [LICENSE](LICENSE) để biết thêm.
+- Plugin tự reconnect nếu mất kết nối
+- Timeout mặc định 30s per call  
+- `async/await` được support trong code gửi lên
+- Kết quả trả về dưới dạng JSON string
