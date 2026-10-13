@@ -129,16 +129,16 @@ function connect() {
       // Gửi sang code.js để thực thi trong figma sandbox
       var id = msg.id;
       var code = msg.payload.code;
+      var timeoutMs = msg.timeout || 30000; // Bằng timeout của MCP server cho call này
 
       var p = new Promise(function(resolve, reject) {
         pendingCalls[id] = { resolve: resolve, reject: reject };
-        // Timeout 25s
         setTimeout(function() {
           if (pendingCalls[id]) {
             delete pendingCalls[id];
             reject('Timeout — code.js không phản hồi');
           }
-        }, 25000);
+        }, timeoutMs);
       });
 
       // Post sang plugin sandbox
