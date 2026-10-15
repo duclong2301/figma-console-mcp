@@ -99,6 +99,7 @@ return figma.createComponentFromNode(sel).id
 - **Kết nối theo từng lệnh:** MCP server không giữ port 9988. Mỗi tool call mở port → chờ plugin kết nối → chạy lệnh → đóng port ngay. Nhiều Claude (nhiều session, Claude Desktop + Claude Code) dùng chung một plugin được; ai gọi sau thì chờ đến lượt (tối đa 60s).
 - Plugin thử kết nối lại mỗi 500ms, nên mỗi lệnh chậm thêm khoảng 0.5s. Panel hiện "Idle — chờ Claude gọi" khi không có lệnh nào.
 - Code gửi qua `figma_eval` chạy như thân một async function → phải `return` giá trị muốn lấy về
-- Timeout mặc định 30s per call  
+- Timeout mặc định 30s per call, đổi bằng tham số `timeout` của `figma_eval` (plugin chờ đúng bằng thời gian đó)
 - `async/await` được support trong code gửi lên
 - Kết quả trả về dưới dạng JSON string
+- Port chỉ mở trên `127.0.0.1` (giống `f2u.py`, nên hai bên nhận ra port đang bận) và chỉ nhận kết nối có origin `null` (iframe của plugin) hoặc không có origin, nên trang web thường không chen vào được

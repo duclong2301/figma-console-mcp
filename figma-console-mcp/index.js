@@ -14,6 +14,9 @@ const { StdioServerTransport } = require("@modelcontextprotocol/sdk/server/stdio
 const { CallToolRequestSchema, ListToolsRequestSchema } = require("@modelcontextprotocol/sdk/types.js");
 const { WebSocketServer } = require("ws");
 
+// Bind đúng 127.0.0.1 như f2u.py: không mở ra LAN, và bind trùng địa chỉ mới báo EADDRINUSE.
+// Bind wildcard (::) vẫn thành công song song với 127.0.0.1:9988 nên không biết port đang bận.
+const WS_HOST = "127.0.0.1";
 const WS_PORT = 9988;            // Port Figma plugin sẽ connect vào
 const PORT_WAIT_MS = 60000;      // Chờ tối đa khi Claude khác đang giữ port
 const PORT_RETRY_MS = 200;
@@ -28,10 +31,16 @@ let queue = Promise.resolve();   // Các call trong cùng process chạy lần l
 const log = (text) => process.stderr.write(`[figma-console-mcp] ${text}\n`);
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
+// UI của plugin Figma chạy trong iframe có origin "null". Trang web bình thường gửi origin
+// thật của nó nên bị chặn, không thể kết nối trước plugin rồi nhận lệnh / trả kết quả giả.
+function verifyClient(info) {
+  return info.origin === undefined || info.origin === "null";
+}
+
 // ── Mở port, thử lại nếu Claude khác đang giữ ──────────────────
 function listenOnce() {
   return new Promise((resolve, reject) => {
-    const wss = new WebSocketServer({ port: WS_PORT });
+    const wss = new WebSocketServer({ host: WS_HOST, port: WS_PORT, verifyClient });
     wss.once("listening", () => {
       wss.removeAllListeners("error");
       wss.on("error", (err) => log(`WS error: ${err.message}`));
@@ -111,7 +120,8 @@ async function runSession(type, payload, timeoutMs, opts) {
   const wss = await openServer(opts.portWaitMs);
   try {
     const ws = await waitForPlugin(wss, opts.pluginWaitMs);
-    return await request(ws, { id: ++callIdCounter, type, payload }, timeoutMs);
+    // Gửi kèm timeout để ui.html chờ đúng bằng thời gian này
+    return await request(ws, { id: ++callIdCounter, type, payload, timeout: timeoutMs }, timeoutMs);
   } finally {
     await closeServer(wss);
   }

@@ -18,8 +18,10 @@ figma.ui.onmessage = async function(msg) {
   var code = msg.code;
 
   try {
-    // Dùng Function constructor thay vì eval — support await
-    var fn = new Function("return (async () => { " + code + " })()");
+    // Dùng Function constructor thay vì eval — support await.
+    // Code là thân hàm nên cần `return` để trả kết quả. Xuống dòng hai đầu để code
+    // kết thúc bằng comment `//` không nuốt mất phần `})()` phía sau.
+    var fn = new Function("return (async () => {\n" + code + "\n})()");
     var result = await fn();
 
     var serialized;
