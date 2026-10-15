@@ -27,7 +27,7 @@
   .dot {
     width: 7px; height: 7px;
     border-radius: 50%;
-    background: #F59E0B;
+    background: #9CA3AF;
     flex-shrink: 0;
     transition: background 0.3s;
   }
@@ -38,7 +38,7 @@
     background: #2A2A2A;
     border-radius: 6px;
     border: 1px solid #333;
-    color: #F59E0B;
+    color: #9CA3AF;
   }
   .port { color: #4B5563; font-size: 10px; }
   #log {
@@ -63,13 +63,13 @@
     <div class="dot" id="dot"></div>
     Claude Console Bridge
   </div>
-  <div id="status">Connecting...</div>
+  <div id="status">Idle — chờ Claude gọi</div>
   <div class="port">ws://localhost:9988</div>
   <div id="log"></div>
 
 <script>
 var WS_URL = 'ws://localhost:9988';
-var RECONNECT_MS = 3000;
+var RECONNECT_MS = 500; // Server chỉ mở port khi Claude gọi tool → thử lại liên tục
 var ws = null;
 var pendingCalls = {}; // id -> {resolve, reject}
 
@@ -113,12 +113,10 @@ window.onmessage = function(event) {
 
 // ── WebSocket → MCP Server ────────────────────────────────────
 function connect() {
-  setStatus('Connecting...', '#F59E0B');
   ws = new WebSocket(WS_URL);
 
   ws.onopen = function() {
-    setStatus('✅ Connected to Claude MCP', '#10B981');
-    addLog('Connected ✓');
+    setStatus('⚡ Claude đang lấy data...', '#10B981');
   };
 
   ws.onmessage = function(event) {
@@ -129,16 +127,16 @@ function connect() {
       // Gửi sang code.js để thực thi trong figma sandbox
       var id = msg.id;
       var code = msg.payload.code;
-      var timeoutMs = msg.timeout || 30000; // Bằng timeout của MCP server cho call này
 
       var p = new Promise(function(resolve, reject) {
         pendingCalls[id] = { resolve: resolve, reject: reject };
+        // Timeout 25s
         setTimeout(function() {
           if (pendingCalls[id]) {
             delete pendingCalls[id];
             reject('Timeout — code.js không phản hồi');
           }
-        }, timeoutMs);
+        }, 25000);
       });
 
       // Post sang plugin sandbox
@@ -152,12 +150,11 @@ function connect() {
     }
   };
 
-  ws.onerror = function() {
-    setStatus('❌ Error', '#EF4444');
-  };
+  // Không kết nối được = chưa có Claude nào gọi, không phải lỗi
+  ws.onerror = function() {};
 
   ws.onclose = function() {
-    setStatus('Reconnecting...', '#9CA3AF');
+    setStatus('Idle — chờ Claude gọi', '#9CA3AF');
     setTimeout(connect, RECONNECT_MS);
   };
 }

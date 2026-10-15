@@ -3,126 +3,131 @@
  * figma-console-mcp
  * MCP server cho phép Claude gửi JS trực tiếp vào Figma Desktop plugin context
  * Transport: stdio (Claude Desktop) <-> WebSocket (Figma Plugin)
+ *
+ * Mỗi tool call là một phiên ngắn: mở port 9988 → chờ plugin kết nối → gửi lệnh
+ * → nhận kết quả → đóng port. Nhờ vậy nhiều Claude (nhiều session/app) dùng chung
+ * một plugin được: ai cần thì giữ port trong lúc gọi, người khác chờ đến lượt.
  */
 
 const { Server } = require("@modelcontextprotocol/sdk/server/index.js");
 const { StdioServerTransport } = require("@modelcontextprotocol/sdk/server/stdio.js");
 const { CallToolRequestSchema, ListToolsRequestSchema } = require("@modelcontextprotocol/sdk/types.js");
-const { WebSocketServer, WebSocket } = require("ws");
+const { WebSocketServer } = require("ws");
 
-const WS_HOST = "127.0.0.1"; // Chỉ nhận kết nối từ chính máy này, không mở ra LAN
-const WS_PORT = 9988; // Port Figma plugin sẽ connect vào
-const WS_RETRY_MS = 5000; // Port đang bị instance khác giữ → thử lại sau mỗi 5s
+const WS_PORT = 9988;            // Port Figma plugin sẽ connect vào
+const PORT_WAIT_MS = 60000;      // Chờ tối đa khi Claude khác đang giữ port
+const PORT_RETRY_MS = 200;
+const PLUGIN_WAIT_MS = 8000;     // Chờ plugin kết nối sau khi đã mở port (plugin thử lại mỗi 500ms)
 
-// ── State ──────────────────────────────────────────────────────
-let figmaSocket = null;       // WebSocket connection từ Figma plugin (kết nối mới nhất)
-const figmaSockets = new Set(); // Mọi plugin đang kết nối, theo thứ tự kết nối
-let wsListenError = null;     // Lý do chưa mở được port (vd. EADDRINUSE), null khi đang listen
-const pendingCalls = new Map(); // callId -> { resolve, reject, timer, ws }
+const NOT_RUNNING_MSG =
+  "Figma plugin chưa chạy. Mở Figma Desktop → Plugins → Development → figma-console-bridge → Run";
+
 let callIdCounter = 0;
+let queue = Promise.resolve();   // Các call trong cùng process chạy lần lượt
 
-// ── WebSocket Server (nhận kết nối từ Figma plugin) ────────────
-// UI của plugin Figma chạy trong iframe có origin "null". Trang web bình thường gửi origin
-// thật của nó nên bị chặn, không chiếm được kết nối hay trả kết quả giả về cho Claude.
-function verifyClient(info) {
-  return info.origin === undefined || info.origin === "null";
-}
+const log = (text) => process.stderr.write(`[figma-console-mcp] ${text}\n`);
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
-function startWebSocketServer() {
-  const wss = new WebSocketServer({ host: WS_HOST, port: WS_PORT, verifyClient });
-
-  wss.on("listening", () => {
-    wsListenError = null;
-    process.stderr.write(`[figma-console-mcp] WebSocket server listening on ws://${WS_HOST}:${WS_PORT}\n`);
-  });
-
-  // Không có handler này thì EADDRINUSE (session Claude khác đang chạy figma-console-mcp)
-  // làm crash cả MCP server. Giữ MCP sống và thử lại cho tới khi port được nhả.
-  wss.on("error", (err) => {
-    wsListenError = err.code === "EADDRINUSE"
-      ? `Port ${WS_PORT} đang bị một figma-console-mcp khác giữ (session Claude khác)`
-      : `WebSocket server lỗi: ${err.message}`;
-    process.stderr.write(`[figma-console-mcp] ${wsListenError}, thử lại sau ${WS_RETRY_MS / 1000}s\n`);
-    wss.close();
-    setTimeout(startWebSocketServer, WS_RETRY_MS);
-  });
-
-  wss.on("connection", onFigmaConnection);
-}
-
-function onFigmaConnection(ws) {
-  // Kết nối mới nhất được dùng (vd. chạy lại plugin, hoặc mở plugin ở file Figma khác)
-  figmaSockets.add(ws);
-  figmaSocket = ws;
-  process.stderr.write("[figma-console-mcp] Figma plugin connected ✓\n");
-
-  ws.on("message", (raw) => {
-    try {
-      const msg = JSON.parse(raw.toString());
-      // msg = { id, result?, error? }
-      const pending = pendingCalls.get(msg.id);
-      if (!pending) return;
-      clearTimeout(pending.timer);
-      pendingCalls.delete(msg.id);
-      if (msg.error) {
-        pending.reject(new Error(msg.error));
-      } else {
-        pending.resolve(msg.result);
-      }
-    } catch (e) {
-      process.stderr.write(`[figma-console-mcp] Parse error: ${e.message}\n`);
-    }
-  });
-
-  ws.on("close", () => {
-    figmaSockets.delete(ws);
-    // Chỉ reject các call đã gửi qua socket này
-    for (const [id, pending] of pendingCalls) {
-      if (pending.ws !== ws) continue;
-      clearTimeout(pending.timer);
-      pending.reject(new Error("Figma plugin disconnected"));
-      pendingCalls.delete(id);
-    }
-    // Socket cũ đóng không được ngắt socket đang dùng
-    if (figmaSocket !== ws) return;
-    figmaSocket = [...figmaSockets].pop() || null;
-    process.stderr.write(figmaSocket
-      ? "[figma-console-mcp] Figma plugin disconnected, chuyển sang plugin còn lại\n"
-      : "[figma-console-mcp] Figma plugin disconnected\n");
-  });
-
-  ws.on("error", (err) => {
-    process.stderr.write(`[figma-console-mcp] WS error: ${err.message}\n`);
-  });
-}
-
-startWebSocketServer();
-
-// ── Helper: send command to Figma, wait for result ─────────────
-function sendToFigma(type, payload, timeoutMs = 30000) {
+// ── Mở port, thử lại nếu Claude khác đang giữ ──────────────────
+function listenOnce() {
   return new Promise((resolve, reject) => {
-    if (!figmaSocket || figmaSocket.readyState !== WebSocket.OPEN) {
-      return reject(new Error(wsListenError
-        ? `${wsListenError}. Dùng figma-console ở session đó, hoặc đóng session đó rồi thử lại`
-        : "Figma plugin chưa kết nối. Mở Figma Desktop → Plugins → figma-console-bridge → Run"
-      ));
-    }
-
-    const id = ++callIdCounter;
-    const timer = setTimeout(() => {
-      pendingCalls.delete(id);
-      reject(new Error(`Timeout sau ${timeoutMs}ms — Figma plugin không phản hồi`));
-    }, timeoutMs);
-
-    pendingCalls.set(id, { resolve, reject, timer, ws: figmaSocket });
-    // Gửi kèm timeout để ui.html chờ đúng bằng thời gian này
-    figmaSocket.send(JSON.stringify({ id, type, payload, timeout: timeoutMs }));
+    const wss = new WebSocketServer({ port: WS_PORT });
+    wss.once("listening", () => {
+      wss.removeAllListeners("error");
+      wss.on("error", (err) => log(`WS error: ${err.message}`));
+      resolve(wss);
+    });
+    wss.once("error", (err) => {
+      wss.close();
+      reject(err);
+    });
   });
+}
+
+async function openServer(portWaitMs) {
+  const deadline = Date.now() + portWaitMs;
+  for (;;) {
+    try {
+      return await listenOnce();
+    } catch (err) {
+      if (err.code !== "EADDRINUSE") throw err;
+      if (Date.now() >= deadline) {
+        throw new Error(`Port ${WS_PORT} vẫn bận sau ${portWaitMs}ms — có thể một Claude khác đang chạy lệnh dài`);
+      }
+      await sleep(PORT_RETRY_MS);
+    }
+  }
+}
+
+function waitForPlugin(wss, ms) {
+  return new Promise((resolve, reject) => {
+    const timer = setTimeout(() => reject(new Error(NOT_RUNNING_MSG)), ms);
+    wss.once("connection", (ws) => {
+      clearTimeout(timer);
+      resolve(ws);
+    });
+  });
+}
+
+function request(ws, msg, timeoutMs) {
+  return new Promise((resolve, reject) => {
+    const timer = setTimeout(
+      () => reject(new Error(`Timeout sau ${timeoutMs}ms — Figma plugin không phản hồi`)),
+      timeoutMs
+    );
+    ws.on("message", (raw) => {
+      let res;
+      try {
+        res = JSON.parse(raw.toString());
+      } catch (e) {
+        log(`Parse error: ${e.message}`);
+        return;
+      }
+      if (res.id !== msg.id) return;
+      clearTimeout(timer);
+      if (res.error) reject(new Error(res.error));
+      else resolve(res.result);
+    });
+    ws.on("close", () => {
+      clearTimeout(timer);
+      reject(new Error("Figma plugin ngắt kết nối giữa chừng"));
+    });
+    ws.send(JSON.stringify(msg));
+  });
+}
+
+function closeServer(wss) {
+  return new Promise((resolve) => {
+    for (const client of wss.clients) {
+      client.close(1000, "done");
+      setTimeout(() => client.terminate(), 500).unref();
+    }
+    wss.close(() => resolve());
+  });
+}
+
+// ── Một phiên: mở port → chờ plugin → gửi lệnh → đóng port ─────
+async function runSession(type, payload, timeoutMs, opts) {
+  const wss = await openServer(opts.portWaitMs);
+  try {
+    const ws = await waitForPlugin(wss, opts.pluginWaitMs);
+    return await request(ws, { id: ++callIdCounter, type, payload }, timeoutMs);
+  } finally {
+    await closeServer(wss);
+  }
+}
+
+function sendToFigma(type, payload, timeoutMs = 30000, opts = {}) {
+  const o = { portWaitMs: PORT_WAIT_MS, pluginWaitMs: PLUGIN_WAIT_MS, ...opts };
+  const run = () => runSession(type, payload, timeoutMs, o);
+  const p = queue.then(run, run);
+  queue = p.catch(() => {});
+  return p;
 }
 
 // ── MCP Server ─────────────────────────────────────────────────
 const server = new Server(
-  { name: "figma-console-mcp", version: "1.0.0" },
+  { name: "figma-console-mcp", version: "1.1.0" },
   { capabilities: { tools: {} } }
 );
 
@@ -130,13 +135,13 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
   tools: [
     {
       name: "figma_eval",
-      description: "Thực thi JavaScript trong Figma Plugin context. Code có full access vào figma.* API. Code chạy trong thân một hàm async: phải dùng `return` để lấy kết quả (không có `return` thì nhận (undefined)). Object được trả về dưới dạng JSON string.",
+      description: "Thực thi JavaScript trong Figma Plugin context. Code có full access vào figma.* API. Code chạy như thân một async function: dùng `return` để trả kết quả (object sẽ được JSON.stringify).",
       inputSchema: {
         type: "object",
         properties: {
           code: {
             type: "string",
-            description: "JavaScript code để chạy, là thân của một hàm async: dùng được await, kết thúc bằng `return <giá trị>` để lấy kết quả. Ví dụ: `return figma.currentPage.children.map(n => n.name)`"
+            description: "JavaScript code để chạy. Có thể dùng await. Phải `return` giá trị muốn lấy về."
           },
           timeout: {
             type: "number",
@@ -148,7 +153,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
     },
     {
       name: "figma_status",
-      description: "Kiểm tra trạng thái kết nối với Figma Desktop plugin",
+      description: "Kiểm tra Figma Desktop plugin có đang chạy và trả lời được không",
       inputSchema: { type: "object", properties: {} }
     },
     {
@@ -170,17 +175,17 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
   try {
     switch (name) {
       case "figma_status": {
-        const connected = figmaSocket && figmaSocket.readyState === WebSocket.OPEN;
-        return {
-          content: [{
-            type: "text",
-            text: connected
-              ? "✅ Figma plugin đang kết nối (ws://localhost:" + WS_PORT + ")"
-              : wsListenError
-                ? `❌ ${wsListenError} — session này chưa dùng được figma-console, đang thử lại`
-                : "❌ Chưa kết nối — Mở Figma Desktop → Plugins → figma-console-bridge → Run"
-          }]
-        };
+        try {
+          const info = await sendToFigma(
+            "eval",
+            { code: `return figma.root.name + " / " + figma.currentPage.name;` },
+            5000,
+            { portWaitMs: 10000, pluginWaitMs: 4000 }
+          );
+          return { content: [{ type: "text", text: `✅ Figma plugin đang chạy — file: ${info}` }] };
+        } catch (err) {
+          return { content: [{ type: "text", text: `❌ ${err.message}` }] };
+        }
       }
 
       case "figma_eval": {
@@ -205,7 +210,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
               id: n.id, name: n.name, type: n.type,
               x: Math.round(n.x), y: Math.round(n.y),
               width: Math.round(n.width), height: Math.round(n.height)
-            })))
+            })));
           `
         });
         return { content: [{ type: "text", text: result || "[]" }] };
@@ -223,10 +228,10 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
                 id: n.id, name: n.name, type: n.type,
                 x: Math.round(n.x), y: Math.round(n.y)
               }))
-            })
+            });
           `
         });
-        return { content: [{ type: "text", text: result || "{}" }] };
+        return { content: [{ type: "text", text: result }] };
       }
 
       default:
@@ -244,10 +249,10 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
 async function main() {
   const transport = new StdioServerTransport();
   await server.connect(transport);
-  process.stderr.write("[figma-console-mcp] MCP server started (stdio)\n");
+  log("MCP server started (stdio) — port 9988 chỉ mở trong lúc gọi tool");
 }
 
 main().catch((err) => {
-  process.stderr.write(`[figma-console-mcp] Fatal: ${err.message}\n`);
+  log(`Fatal: ${err.message}`);
   process.exit(1);
 });
