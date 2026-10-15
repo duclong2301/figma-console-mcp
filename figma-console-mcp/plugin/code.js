@@ -1,8 +1,8 @@
 /**
  * figma-console-bridge — code.js (Plugin Sandbox)
  *
- * KHÔNG có WebSocket ở đây — sandbox không support.
- * WebSocket chạy trong ui.html (iframe).
+ * No WebSocket here — the plugin sandbox does not support it.
+ * The WebSocket lives in ui.html (iframe).
  *
  * Flow:
  *   MCP Server <--WS--> ui.html <--postMessage--> code.js <--figma API-->
@@ -10,7 +10,7 @@
 
 figma.showUI(__html__, { width: 280, height: 180, title: "Console Bridge" });
 
-// Nhận lệnh từ ui.html, thực thi figma API, trả kết quả về ui.html
+// Receive commands from ui.html, run them against the figma API, send results back to ui.html
 figma.ui.onmessage = async function(msg) {
   if (msg.type !== "eval") return;
 
@@ -18,9 +18,9 @@ figma.ui.onmessage = async function(msg) {
   var code = msg.code;
 
   try {
-    // Dùng Function constructor thay vì eval — support await.
-    // Code là thân hàm nên cần `return` để trả kết quả. Xuống dòng hai đầu để code
-    // kết thúc bằng comment `//` không nuốt mất phần `})()` phía sau.
+    // Function constructor instead of eval, so the code can use await.
+    // The code is a function body, so it needs `return` to produce a result. The newlines on
+    // both sides keep a trailing `//` comment from swallowing the closing `})()`.
     var fn = new Function("return (async () => {\n" + code + "\n})()");
     var result = await fn();
 

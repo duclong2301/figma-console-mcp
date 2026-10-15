@@ -63,13 +63,13 @@
     <div class="dot" id="dot"></div>
     Claude Console Bridge
   </div>
-  <div id="status">Idle — chờ Claude gọi</div>
+  <div id="status">Idle — waiting for Claude</div>
   <div class="port">ws://localhost:9988</div>
   <div id="log"></div>
 
 <script>
 var WS_URL = 'ws://localhost:9988';
-var RECONNECT_MS = 500; // Server chỉ mở port khi Claude gọi tool → thử lại liên tục
+var RECONNECT_MS = 500; // The server only opens the port during a tool call → keep retrying
 var ws = null;
 var pendingCalls = {}; // id -> {resolve, reject}
 
@@ -92,7 +92,7 @@ function addLog(text, isErr) {
   logEl.scrollTop = logEl.scrollHeight;
 }
 
-// ── Nhận kết quả từ code.js (figma sandbox) ──────────────────
+// ── Results from code.js (figma sandbox) ─────────────────────
 window.onmessage = function(event) {
   var msg = event.data.pluginMessage;
   if (!msg) return;
@@ -116,7 +116,7 @@ function connect() {
   ws = new WebSocket(WS_URL);
 
   ws.onopen = function() {
-    setStatus('⚡ Claude đang lấy data...', '#10B981');
+    setStatus('⚡ Running command from Claude...', '#10B981');
   };
 
   ws.onmessage = function(event) {
@@ -124,22 +124,22 @@ function connect() {
     try { msg = JSON.parse(event.data); } catch(e) { return; }
 
     if (msg.type === 'eval') {
-      // Gửi sang code.js để thực thi trong figma sandbox
+      // Hand off to code.js to run in the figma sandbox
       var id = msg.id;
       var code = msg.payload.code;
-      var timeoutMs = msg.timeout || 30000; // Bằng timeout của MCP server cho call này
+      var timeoutMs = msg.timeout || 30000; // Same as the MCP server's timeout for this call
 
       var p = new Promise(function(resolve, reject) {
         pendingCalls[id] = { resolve: resolve, reject: reject };
         setTimeout(function() {
           if (pendingCalls[id]) {
             delete pendingCalls[id];
-            reject('Timeout — code.js không phản hồi');
+            reject('Timed out — code.js did not respond');
           }
         }, timeoutMs);
       });
 
-      // Post sang plugin sandbox
+      // Post to the plugin sandbox
       parent.postMessage({ pluginMessage: { type: 'eval', id: id, code: code } }, '*');
 
       p.then(function(result) {
@@ -150,11 +150,11 @@ function connect() {
     }
   };
 
-  // Không kết nối được = chưa có Claude nào gọi, không phải lỗi
+  // A failed connection just means no Claude call is in progress, not an error
   ws.onerror = function() {};
 
   ws.onclose = function() {
-    setStatus('Idle — chờ Claude gọi', '#9CA3AF');
+    setStatus('Idle — waiting for Claude', '#9CA3AF');
     setTimeout(connect, RECONNECT_MS);
   };
 }

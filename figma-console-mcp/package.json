@@ -1,7 +1,7 @@
 {
   "name": "figma-console-mcp",
   "version": "1.0.0",
-  "description": "MCP server — gửi JS trực tiếp vào Figma Desktop plugin context",
+  "description": "MCP server that runs JavaScript directly in the Figma Desktop plugin context",
   "main": "index.js",
   "bin": {
     "figma-console-mcp": "./index.js"

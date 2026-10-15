@@ -1,12 +1,12 @@
 #!/usr/bin/env node
 /**
  * figma-console-mcp
- * MCP server cho phép Claude gửi JS trực tiếp vào Figma Desktop plugin context
- * Transport: stdio (Claude Desktop) <-> WebSocket (Figma Plugin)
+ * MCP server that lets Claude run JavaScript directly in the Figma Desktop plugin context
+ * Transport: stdio (Claude) <-> WebSocket (Figma plugin)
  *
- * Mỗi tool call là một phiên ngắn: mở port 9988 → chờ plugin kết nối → gửi lệnh
- * → nhận kết quả → đóng port. Nhờ vậy nhiều Claude (nhiều session/app) dùng chung
- * một plugin được: ai cần thì giữ port trong lúc gọi, người khác chờ đến lượt.
+ * Each tool call is a short session: open port 9988 → wait for the plugin to connect → send
+ * the command → receive the result → close the port. This lets several Claude sessions/apps
+ * share one plugin: whoever needs it holds the port for the call, everyone else waits their turn.
  */
 
 const { Server } = require("@modelcontextprotocol/sdk/server/index.js");
@@ -14,30 +14,30 @@ const { StdioServerTransport } = require("@modelcontextprotocol/sdk/server/stdio
 const { CallToolRequestSchema, ListToolsRequestSchema } = require("@modelcontextprotocol/sdk/types.js");
 const { WebSocketServer } = require("ws");
 
-// Bind đúng 127.0.0.1 như f2u.py: không mở ra LAN, và bind trùng địa chỉ mới báo EADDRINUSE.
-// Bind wildcard (::) vẫn thành công song song với 127.0.0.1:9988 nên không biết port đang bận.
+// Bind exactly 127.0.0.1: the port stays off the LAN, and only a bind to the same address reports
+// EADDRINUSE. A wildcard (::) bind still succeeds next to 127.0.0.1:9988, so a busy port would go unnoticed.
 const WS_HOST = "127.0.0.1";
-const WS_PORT = 9988;            // Port Figma plugin sẽ connect vào
-const PORT_WAIT_MS = 60000;      // Chờ tối đa khi Claude khác đang giữ port
+const WS_PORT = 9988;            // Port the Figma plugin connects to
+const PORT_WAIT_MS = 60000;      // Max wait while another Claude session holds the port
 const PORT_RETRY_MS = 200;
-const PLUGIN_WAIT_MS = 8000;     // Chờ plugin kết nối sau khi đã mở port (plugin thử lại mỗi 500ms)
+const PLUGIN_WAIT_MS = 8000;     // Wait for the plugin after opening the port (it retries every 500ms)
 
 const NOT_RUNNING_MSG =
-  "Figma plugin chưa chạy. Mở Figma Desktop → Plugins → Development → figma-console-bridge → Run";
+  "Figma plugin is not running. In Figma Desktop: Plugins → Development → figma-console-bridge → Run";
 
 let callIdCounter = 0;
-let queue = Promise.resolve();   // Các call trong cùng process chạy lần lượt
+let queue = Promise.resolve();   // Calls within one process run one at a time
 
 const log = (text) => process.stderr.write(`[figma-console-mcp] ${text}\n`);
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
-// UI của plugin Figma chạy trong iframe có origin "null". Trang web bình thường gửi origin
-// thật của nó nên bị chặn, không thể kết nối trước plugin rồi nhận lệnh / trả kết quả giả.
+// The Figma plugin UI runs in an iframe with a "null" origin. Regular web pages send their real
+// origin and are rejected, so they cannot connect before the plugin and receive commands or fake results.
 function verifyClient(info) {
   return info.origin === undefined || info.origin === "null";
 }
 
-// ── Mở port, thử lại nếu Claude khác đang giữ ──────────────────
+// ── Open the port, retrying while another Claude session holds it ──
 function listenOnce() {
   return new Promise((resolve, reject) => {
     const wss = new WebSocketServer({ host: WS_HOST, port: WS_PORT, verifyClient });
@@ -61,7 +61,7 @@ async function openServer(portWaitMs) {
     } catch (err) {
       if (err.code !== "EADDRINUSE") throw err;
       if (Date.now() >= deadline) {
-        throw new Error(`Port ${WS_PORT} vẫn bận sau ${portWaitMs}ms — có thể một Claude khác đang chạy lệnh dài`);
+        throw new Error(`Port ${WS_PORT} still busy after ${portWaitMs}ms — another Claude session may be running a long command`);
       }
       await sleep(PORT_RETRY_MS);
     }
@@ -81,7 +81,7 @@ function waitForPlugin(wss, ms) {
 function request(ws, msg, timeoutMs) {
   return new Promise((resolve, reject) => {
     const timer = setTimeout(
-      () => reject(new Error(`Timeout sau ${timeoutMs}ms — Figma plugin không phản hồi`)),
+      () => reject(new Error(`Timed out after ${timeoutMs}ms — Figma plugin did not respond`)),
       timeoutMs
     );
     ws.on("message", (raw) => {
@@ -99,7 +99,7 @@ function request(ws, msg, timeoutMs) {
     });
     ws.on("close", () => {
       clearTimeout(timer);
-      reject(new Error("Figma plugin ngắt kết nối giữa chừng"));
+      reject(new Error("Figma plugin disconnected mid-call"));
     });
     ws.send(JSON.stringify(msg));
   });
@@ -115,12 +115,12 @@ function closeServer(wss) {
   });
 }
 
-// ── Một phiên: mở port → chờ plugin → gửi lệnh → đóng port ─────
+// ── One session: open port → wait for plugin → send command → close port ──
 async function runSession(type, payload, timeoutMs, opts) {
   const wss = await openServer(opts.portWaitMs);
   try {
     const ws = await waitForPlugin(wss, opts.pluginWaitMs);
-    // Gửi kèm timeout để ui.html chờ đúng bằng thời gian này
+    // Send the timeout along so ui.html waits exactly as long
     return await request(ws, { id: ++callIdCounter, type, payload, timeout: timeoutMs }, timeoutMs);
   } finally {
     await closeServer(wss);
@@ -145,17 +145,17 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
   tools: [
     {
       name: "figma_eval",
-      description: "Thực thi JavaScript trong Figma Plugin context. Code có full access vào figma.* API. Code chạy như thân một async function: dùng `return` để trả kết quả (object sẽ được JSON.stringify).",
+      description: "Run JavaScript in the Figma plugin context with full access to the figma.* Plugin API. The code runs as the body of an async function: use `return` to send back a result (objects are JSON.stringify'd).",
       inputSchema: {
         type: "object",
         properties: {
           code: {
             type: "string",
-            description: "JavaScript code để chạy. Có thể dùng await. Phải `return` giá trị muốn lấy về."
+            description: "JavaScript to run. `await` is allowed. You must `return` the value you want back."
           },
           timeout: {
             type: "number",
-            description: "Timeout tính bằng ms (mặc định 30000)"
+            description: "Timeout in ms (default 30000)"
           }
         },
         required: ["code"]
@@ -163,17 +163,17 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
     },
     {
       name: "figma_status",
-      description: "Kiểm tra Figma Desktop plugin có đang chạy và trả lời được không",
+      description: "Check that the Figma Desktop plugin is running and responding",
       inputSchema: { type: "object", properties: {} }
     },
     {
       name: "figma_get_selection",
-      description: "Lấy thông tin các node đang được select trong Figma",
+      description: "Get the nodes currently selected in Figma (id, name, type, position, size)",
       inputSchema: { type: "object", properties: {} }
     },
     {
       name: "figma_get_page",
-      description: "Lấy thông tin trang hiện tại (tên, id, danh sách children top-level)",
+      description: "Get the current page (name, id, top-level children)",
       inputSchema: { type: "object", properties: {} }
     }
   ]
@@ -192,7 +192,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
             5000,
             { portWaitMs: 10000, pluginWaitMs: 4000 }
           );
-          return { content: [{ type: "text", text: `✅ Figma plugin đang chạy — file: ${info}` }] };
+          return { content: [{ type: "text", text: `✅ Figma plugin is running — file: ${info}` }] };
         } catch (err) {
           return { content: [{ type: "text", text: `❌ ${err.message}` }] };
         }
@@ -245,7 +245,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       }
 
       default:
-        throw new Error(`Tool không tồn tại: ${name}`);
+        throw new Error(`Unknown tool: ${name}`);
     }
   } catch (err) {
     return {
@@ -259,7 +259,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
 async function main() {
   const transport = new StdioServerTransport();
   await server.connect(transport);
-  log("MCP server started (stdio) — port 9988 chỉ mở trong lúc gọi tool");
+  log("MCP server started (stdio) — port 9988 opens only during tool calls");
 }
 
 main().catch((err) => {
