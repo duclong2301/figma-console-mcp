@@ -130,10 +130,6 @@ return figma.createComponentFromNode(sel).id
 
 ---
 
-## Credits
-
-The plugin-bridge approach without the REST API was inspired by the figma-mcp-go project by vkhanhqui.
-
 ## License
 
 MIT — see [LICENSE](LICENSE).
